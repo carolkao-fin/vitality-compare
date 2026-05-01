@@ -867,16 +867,109 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 # =========================================================
-# UI — 4 個 Tab
+# Step 5：格式修正（統編補零 + 手機格式）
+# =========================================================
+_TAXID_CANDIDATES  = ["統一編號", "統編", "統編碼", "公司統編", "營利事業統一編號"]
+_MOBILE_CANDIDATES = ["單位聯絡手機", "聯絡手機", "手機", "手機號碼",
+                      "聯絡電話", "電話", "Phone", "Mobile"]
+
+def _is_taxid_col(col_name):
+    name = str(col_name).lower()
+    if any(c.lower() in name for c in _TAXID_CANDIDATES): return True
+    return "統一編號" in col_name or "統編" in col_name
+
+def _is_mobile_col(col_name):
+    name = str(col_name).lower()
+    if any(c.lower() in name for c in _MOBILE_CANDIDATES): return True
+    return any(k in col_name for k in ["手機", "電話", "聯絡"])
+
+def _fix_taxid(x):
+    s = str(x or "").strip()
+    m = re.match(r"^(-?\d+)\.0+$", s)
+    if m: s = m.group(1)
+    s = s.replace(" ", "")
+    return s.zfill(8) if s.isdigit() and len(s) < 8 else s
+
+def _fix_mobile(x):
+    s_raw = str(x or "").strip()
+    m = re.match(r"^(-?\d+)\.0+$", s_raw)
+    if m: s_raw = m.group(1)
+    if s_raw.startswith("+"):
+        return "+" + re.sub(r"[\s\-\./]", "", s_raw[1:])
+    s = re.sub(r"[\s\-\./]", "", s_raw)
+    if s.isdigit() and len(s) == 9 and s[0] == "9": return "0" + s
+    if s.isdigit() and len(s) == 10 and s[0] != "0" and s[1] == "9": return "0" + s[1:]
+    return s
+
+def run_format_fix(sheets_dict, target_sheets=None):
+    """
+    sheets_dict : {sheet_name: DataFrame}
+    target_sheets : list of sheet names to process；None = all
+    回傳 (fixed_dict, log) — fixed_dict 同結構，log 為說明字串清單
+    """
+    log = []
+    fixed = {}
+    process = {k: v for k, v in sheets_dict.items()
+               if target_sheets is None or k in target_sheets}
+
+    for sname, df in sheets_dict.items():
+        if sname not in process:
+            fixed[sname] = df
+            continue
+
+        df_proc = df.copy()
+        tax_cols    = [c for c in df_proc.columns if _is_taxid_col(c)]
+        mobile_cols = [c for c in df_proc.columns if _is_mobile_col(c)]
+
+        if not tax_cols and not mobile_cols:
+            log.append(f"⚠️ {sname}：未找到統編或手機欄位，略過")
+            fixed[sname] = df_proc
+            continue
+
+        for col in tax_cols:
+            before = df_proc[col].head(3).tolist()
+            df_proc[col] = df_proc[col].astype(str).map(_fix_taxid)
+            after  = df_proc[col].head(3).tolist()
+            log.append(f"✔ {sname} / {col}：{before} → {after}")
+
+        for col in mobile_cols:
+            before = df_proc[col].head(3).tolist()
+            df_proc[col] = df_proc[col].astype(str).map(_fix_mobile)
+            after  = df_proc[col].head(3).tolist()
+            log.append(f"✔ {sname} / {col}：{before} → {after}")
+
+        fixed[sname] = df_proc
+
+    return fixed, log
+
+def make_excel_text_fmt(sheets_dict):
+    """用 xlsxwriter 輸出，統編/手機欄位強制套用文字格式（防 Excel 吃掉前導零）"""
+    import xlsxwriter
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        for sname, df in sheets_dict.items():
+            df.to_excel(w, index=False, sheet_name=sname[:31])
+            ws  = w.sheets[sname[:31]]
+            wb  = w.book
+            fmt = wb.add_format({"num_format": "@"})
+            for col_name in df.columns:
+                if _is_taxid_col(col_name) or _is_mobile_col(col_name):
+                    idx = df.columns.get_loc(col_name)
+                    ws.set_column(idx, idx, 18, fmt)
+    return buf.getvalue()
+
+# =========================================================
+# UI — 5 個 Tab
 # =========================================================
 st.title("📊 生命力比對系統")
-st.caption("整合三個工作流程：文章去重 → 文字探勘 → 比對分析")
+st.caption("完整工作流程：文章去重 → 文字探勘 → 比對分析 → 文章比對 → 格式修正")
 
-tab_dedup, tab_mining, tab_match, tab_compare, tab_history = st.tabs([
+tab_dedup, tab_mining, tab_match, tab_compare, tab_fmt, tab_history = st.tabs([
     "📰 Step 1：文章去重",
     "🔍 Step 2：文字探勘",
     "🔗 Step 4：文章比對",
     "📊 Step 3：比對分析",
+    "🔧 Step 5：格式修正",
     "📁 歷史記錄",
 ])
 
@@ -1292,6 +1385,68 @@ with tab_compare:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+
+# ── Step 5：格式修正 ───────────────────────────────────────
+with tab_fmt:
+    st.subheader("格式修正（統編補零 + 手機格式）")
+    st.markdown("""
+    **輸入**：任一比對結果 Excel（通常是 Step 4 輸出）。
+    **功能**：
+    - **統一編號**：去除浮點小數（`24883973.0` → `24883973`）、補前導零至 8 碼
+    - **手機號碼**：去除分隔符、9 碼補 `0`（`933769550` → `0933769550`）
+    - 輸出時套用 Excel 文字格式，防止 Excel 再次吃掉前導零
+    """)
+
+    fmt_file = st.file_uploader("上傳 Excel 檔 (.xlsx)", type=["xlsx"], key="fmt_file")
+
+    if fmt_file:
+        xf = pd.ExcelFile(fmt_file)
+        all_sheets = xf.sheet_names
+        fmt_file.seek(0)
+
+        selected_sheets = st.multiselect(
+            "選擇要處理的工作表（留空表示全部）",
+            options=all_sheets,
+            default=[],
+            key="fmt_sheets",
+        )
+
+        fmt_btn = st.button("🚀 開始格式修正", type="primary",
+                            use_container_width=True, key="fmt_run")
+
+        if fmt_btn:
+            with st.spinner("讀取所有工作表..."):
+                try:
+                    fmt_file.seek(0)
+                    sheets_dict = pd.read_excel(fmt_file, sheet_name=None)
+                except Exception as e:
+                    st.error(f"讀取失敗：{e}")
+                    st.stop()
+
+            target = selected_sheets if selected_sheets else None
+
+            with st.spinner("修正格式中..."):
+                try:
+                    fixed_dict, log = run_format_fix(sheets_dict, target_sheets=target)
+                    excel_bytes = make_excel_text_fmt(fixed_dict)
+                except Exception as e:
+                    st.error(f"格式修正失敗：{e}")
+                    st.stop()
+
+            st.success(f"格式修正完成！共處理 {len(fixed_dict)} 個工作表")
+
+            with st.expander("修正詳細記錄", expanded=True):
+                for line in log:
+                    st.write(line)
+
+            fname_fmt = f"比對結果_修正後_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            st.download_button(
+                label="⬇️ 下載格式修正後 Excel",
+                data=excel_bytes,
+                file_name=fname_fmt,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
 # ── 歷史記錄 ──────────────────────────────────────────────
 with tab_history:
