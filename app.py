@@ -1129,10 +1129,19 @@ with tab_dedup:
                     df_unique.to_excel(w, sheet_name="unique_articles", index=False)
                     df_dupes.to_excel(w, sheet_name="duplicates_summary", index=False)
                 fname_dedup = f"articles_dedup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                dedup_bytes = buf.getvalue()
+                st.session_state.history.insert(0, {
+                    "step":        "Step 1 文章去重",
+                    "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "input_files": [dedup_file.name],
+                    "results":     {"原始筆數": total, "去重後筆數": len(df_unique), "重複組合數": len(df_dupes)},
+                    "fname":       fname_dedup,
+                    "excel":       dedup_bytes,
+                })
 
                 st.download_button(
                     label="⬇️ 下載去重結果 Excel",
-                    data=buf.getvalue(),
+                    data=dedup_bytes,
                     file_name=fname_dedup,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
@@ -1228,11 +1237,20 @@ with tab_mining:
         buf = BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
             result_df.to_excel(w, sheet_name="links", index=False)
-        fname_mining = f"articles_with_keywords_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        fname_mining  = f"articles_with_keywords_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        mining_bytes  = buf.getvalue()
+        st.session_state.history.insert(0, {
+            "step":        "Step 2 文字探勘",
+            "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "input_files": [mining_file.name],
+            "results":     {"文章總數": len(result_df), "未知日期": unknown_ct, "爬取失敗": err_ct},
+            "fname":       fname_mining,
+            "excel":       mining_bytes,
+        })
 
         st.download_button(
             label="⬇️ 下載文字探勘結果 Excel",
-            data=buf.getvalue(),
+            data=mining_bytes,
             file_name=fname_mining,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
@@ -1370,11 +1388,21 @@ with tab_match:
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
             df_main_out.to_excel(w, sheet_name="02_精簡表(指定欄位)", index=False)
             df_report.to_excel(w, sheet_name="比對結果整理", index=False)
-        fname_match = f"比對結果_更新後_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        fname_match  = f"比對結果_更新後_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        match_bytes  = buf.getvalue()
+        st.session_state.history.insert(0, {
+            "step":        "Step 4 文章比對",
+            "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "input_files": [match_kw_file.name, match_main_file.name],
+            "results":     {"本期新增組織": hit_ct, "僅歷史組織": hist_ct,
+                            "文章命中篇數": art_hit, "文章總數": len(df_report)},
+            "fname":       fname_match,
+            "excel":       match_bytes,
+        })
 
         st.download_button(
             label="⬇️ 下載文章比對結果 Excel",
-            data=buf.getvalue(),
+            data=match_bytes,
             file_name=fname_match,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
@@ -1460,15 +1488,22 @@ with tab_compare:
         fname = (f"比對結果_{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                  if label else f"比對結果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
 
+        nc = stats["new_class"]
         st.session_state.history.insert(0, {
-            "label":  label or "（未命名）",
-            "ts":     ts,
-            "file_a": file_a.name,
-            "file_b": file_b.name,
-            "file_p": file_p.name if file_p else "（無）",
-            "fname":  fname,
-            "stats":  stats,
-            "excel":  excel_bytes,
+            "step":        "Step 3 比對分析",
+            "ts":          ts,
+            "label":       label or "",
+            "input_files": [file_a.name, file_b.name] + ([file_p.name] if file_p else []),
+            "results":     {
+                "總筆數":     stats["total"],
+                "持續存在":   nc.get("持續存在", 0),
+                "歷史補回":   nc.get("歷史補回", 0),
+                "本期真正新增": nc.get("本期真正新增", 0),
+                "08 疑似改名": stats["rename_08"],
+                "09 疑似錯編": stats["taxerr_09"],
+            },
+            "fname":       fname,
+            "excel":       excel_bytes,
         })
 
         st.success("✅ 比對完成！")
@@ -1561,6 +1596,15 @@ with tab_fmt:
                     st.write(line)
 
             fname_fmt = f"比對結果_修正後_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            st.session_state.history.insert(0, {
+                "step":        "Step 5 格式修正",
+                "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "input_files": [fmt_file.name],
+                "results":     {"處理工作表數": len(fixed_dict), "修正欄位項目": len(log)},
+                "fname":       fname_fmt,
+                "excel":       excel_bytes,
+            })
+
             st.download_button(
                 label="⬇️ 下載格式修正後 Excel",
                 data=excel_bytes,
@@ -1571,30 +1615,58 @@ with tab_fmt:
 
 # ── 歷史記錄 ──────────────────────────────────────────────
 with tab_history:
-    st.subheader("本次工作階段的比對記錄")
-    st.caption("⚠️ 歷史記錄僅保留於目前瀏覽器工作階段，重新整理頁面後會清除。請及時下載 Excel。")
+    st.subheader("執行記錄")
+    st.caption("⚠️ 記錄僅保留於目前瀏覽器工作階段，重新整理頁面後會清除。請及時下載 Excel。")
 
     if not st.session_state.history:
-        st.info("尚無記錄，執行比對後自動出現。")
+        st.info("尚無記錄，執行任一步驟後自動出現。")
     else:
+        # 全部清除按鈕
+        if st.button("🗑️ 清除所有記錄", type="secondary"):
+            st.session_state.history = []
+            st.rerun()
+
+        STEP_ICON = {
+            "Step 1 文章去重":  "📰",
+            "Step 2 文字探勘":  "🔍",
+            "Step 3 比對分析":  "📊",
+            "Step 4 文章比對":  "🔗",
+            "Step 5 格式修正":  "🔧",
+        }
+
         for i, rec in enumerate(st.session_state.history):
-            with st.expander(f"🗂️ {rec['ts']} ── {rec['label']}", expanded=(i == 0)):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown(f"- **A 檔**：{rec['file_a']}")
-                    st.markdown(f"- **B 檔**：{rec['file_b']}")
-                    st.markdown(f"- **P 檔**：{rec['file_p']}")
-                with c2:
-                    s = rec["stats"]
-                    st.markdown(f"- **總筆數**：{s['total']}")
-                    st.markdown(f"- **08 疑似改名**：{s['rename_08']}")
-                    st.markdown(f"- **09 疑似錯編**：{s['taxerr_09']}")
-                    nc = s.get("new_class", {})
-                    st.markdown(f"- **持續存在**：{nc.get('持續存在', 0)} ／ **本期新增**：{nc.get('本期真正新增', 0)}")
+            step  = rec.get("step", "Step 3 比對分析")
+            icon  = STEP_ICON.get(step, "🗂️")
+            label = rec.get("label", "")
+            title = f"{icon} {rec['ts']}　{step}" + (f"　｜　{label}" if label else "")
+
+            with st.expander(title, expanded=(i == 0)):
+                # ── 日期時間 + 輸入檔
+                col_info, col_del = st.columns([5, 1])
+                with col_info:
+                    st.markdown(f"**執行時間**：`{rec['ts']}`")
+                    files = rec.get("input_files", [])
+                    if files:
+                        st.markdown("**輸入檔案**：" + "、".join(files))
+                with col_del:
+                    if st.button("🗑️ 刪除", key=f"del_{i}", use_container_width=True):
+                        st.session_state.history.pop(i)
+                        st.rerun()
+
+                # ── 執行結果（以 metric 顯示）
+                results = rec.get("results", {})
+                if results:
+                    st.markdown("**執行結果**")
+                    cols = st.columns(min(len(results), 4))
+                    for j, (k, v) in enumerate(results.items()):
+                        cols[j % 4].metric(k, v)
+
+                # ── 下載按鈕
                 st.download_button(
-                    label="⬇️ 下載此次 Excel",
+                    label=f"⬇️ 下載 {rec['fname']}",
                     data=rec["excel"],
                     file_name=rec["fname"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"dl_{i}",
+                    use_container_width=True,
                 )
