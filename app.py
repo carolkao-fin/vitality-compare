@@ -123,6 +123,8 @@ def run_analysis(A, B, P_prev):
     if name_col_A is None: raise KeyError(f"A 找不到名稱欄：{A.columns.tolist()}")
     if name_col_B is None: raise KeyError(f"B 找不到名稱欄：{B.columns.tolist()}")
 
+    A["統編_原始"] = A[tax_col_A]
+    B["統編_原始"] = B[tax_col_B]
     A["K_tax"]   = A[tax_col_A].map(norm_tax)
     A["K_name"]  = A[name_col_A].map(norm_name)
     A["K_name2"] = A[name_col_A].map(norm_name_strong)
@@ -171,6 +173,9 @@ def run_analysis(A, B, P_prev):
     cols_03 = [c for c in [A_id, A_nm, "排序2_new", "組織類型_new", "負責人2_new",
         "單位聯絡電話(市話)_new", "單位聯絡電話-分機_new", "單位聯絡手機_new",
         "電子信箱Email_new", "單位聯絡人_new", "縣市_new", "地址_new",
+        "商品分類一_new", "商品服務一_new", "商品分類二_new", "商品服務二_new",
+        "商品分類三_new", "商品服務三_new",
+        "聯合國永續發展目標-1_new", "聯合國永續發展目標-2_new", "聯合國永續發展目標-3_new",
         "官方網站_new", "Facebook_new", "影音網址_new", "電子商務_new",
         "編號2_old", "組織名稱_old", "負責人2_old"] if c in one2one.columns]
     final_df = one2one[cols_03].copy().rename(columns={A_id: "統一編號", A_nm: "組織名稱2"})
@@ -266,6 +271,25 @@ def run_analysis(A, B, P_prev):
 
     for c in ["社創組織資料庫_new", "社創平台網址上架網址_new", "生命力新聞_new"]:
         if c not in full.columns: full[c] = np.nan
+
+    # 從 P 檔補值社創/生命力新聞三欄
+    # P 檔的 02_精簡表輸出中，這三欄已改名為無後綴，需兼容兩種命名
+    if P_prev is not None and "K_tax_prev" in P_prev.columns and "K_name_prev" in P_prev.columns:
+        for bare_col, new_col in [
+            ("社創組織資料庫",    "社創組織資料庫_new"),
+            ("社創平台網址上架網址", "社創平台網址上架網址_new"),
+            ("生命力新聞",        "生命力新聞_new"),
+        ]:
+            src = bare_col if bare_col in P_prev.columns else (new_col if new_col in P_prev.columns else None)
+            if src is None:
+                continue
+            tmp = (P_prev[["K_tax_prev", "K_name_prev", src]]
+                   .drop_duplicates(["K_tax_prev", "K_name_prev"])
+                   .rename(columns={"K_tax_prev": "_kt", "K_name_prev": "_kn", src: "_src"}))
+            full = full.merge(tmp, left_on=["K_tax", "K_name"], right_on=["_kt", "_kn"], how="left")
+            full.drop(columns=["_kt", "_kn"], inplace=True, errors="ignore")
+            full[new_col] = full[new_col].combine_first(full["_src"])
+            full.drop(columns=["_src"], inplace=True, errors="ignore")
 
     # 02_精簡表
     full["組織名稱2_fb"]  = full.apply(lambda r: fb(r,"組織名稱2_x","組織名稱2_y","組織名稱_old"), axis=1)
