@@ -109,7 +109,33 @@ def fb(r, new_col, *old_cols):
 # =========================================================
 # 主分析函式
 # =========================================================
-def run_analysis(A, B, P_prev):
+def _find_prev_col(P_prev, bare_col, new_col):
+    """從 P 檔找補值欄位：先找完全符合，再找相同前綴的變體（如 生命力新聞_new_match）"""
+    for name in [bare_col, new_col]:
+        if name in P_prev.columns:
+            return name
+    # 前綴比對：找所有以 bare_col 開頭的欄位，取第一個
+    matches = [c for c in P_prev.columns if c.startswith(bare_col)]
+    return matches[0] if matches else None
+
+def _build_init_keys(df, tax_col=None, name_col=None):
+    """從初期檔建立 KEY set，兼容多種欄位命名"""
+    df = df.copy()
+    df.columns = [clean_col(c) for c in df.columns]
+    t = tax_col or pick(df, ["統一編號_final","統一編號_x","統一編號"]) or find_tax_col(df)
+    n = name_col
+    if n is None:
+        n = "K_name" if "K_name" in df.columns else pick(df, ["組織名稱2_final","組織名稱2_x","組織名稱2","組織名稱","名稱"])
+    df["_kt"] = safe_series(df, t).map(norm_tax) if t else pd.Series(index=df.index, dtype="string")
+    if n == "K_name" and "K_name" in df.columns:
+        df["_kn"] = df["K_name"].map(lambda x: str(x).strip() if pd.notna(x) else np.nan)
+    else:
+        df["_kn"] = safe_series(df, n).map(norm_name) if n else pd.Series(index=df.index, dtype="string")
+    keys = df["_kt"].fillna("") + "|" + df["_kn"].fillna("")
+    mask = keys.str.strip().ne("|") & keys.str.strip().ne("")
+    return set(keys[mask])
+
+def run_analysis(A, B, P_prev, I_init=None):
     A.columns = [clean_col(c) for c in A.columns]
     B.columns = [clean_col(c) for c in B.columns]
 
@@ -132,8 +158,12 @@ def run_analysis(A, B, P_prev):
     B["K_name"]  = B[name_col_B].map(norm_name)
     B["K_name2"] = B[name_col_B].map(norm_name_strong)
 
-    B["KEY_init"] = B["K_tax"].fillna("") + "|" + B["K_name"].fillna("")
-    init_keys = set(B["KEY_init"])
+    # init_keys：有上傳最初期比對結果時從該檔建立，否則以 B 檔代替
+    if I_init is not None:
+        init_keys = _build_init_keys(I_init)
+    else:
+        B["KEY_init"] = B["K_tax"].fillna("") + "|" + B["K_name"].fillna("")
+        init_keys = set(B["KEY_init"])
 
     # 上一期
     prev_keys = set()
@@ -273,14 +303,14 @@ def run_analysis(A, B, P_prev):
         if c not in full.columns: full[c] = np.nan
 
     # 從 P 檔補值社創/生命力新聞三欄
-    # P 檔的 02_精簡表輸出中，這三欄已改名為無後綴，需兼容兩種命名
+    # 用 _find_prev_col 兼容多種命名變體，包含 生命力新聞_new_match 等
     if P_prev is not None and "K_tax_prev" in P_prev.columns and "K_name_prev" in P_prev.columns:
         for bare_col, new_col in [
             ("社創組織資料庫",    "社創組織資料庫_new"),
             ("社創平台網址上架網址", "社創平台網址上架網址_new"),
             ("生命力新聞",        "生命力新聞_new"),
         ]:
-            src = bare_col if bare_col in P_prev.columns else (new_col if new_col in P_prev.columns else None)
+            src = _find_prev_col(P_prev, bare_col, new_col)
             if src is None:
                 continue
             tmp = (P_prev[["K_tax_prev", "K_name_prev", src]]
@@ -381,29 +411,37 @@ if "history" not in st.session_state:
 # UI
 # =========================================================
 st.title("📊 生命力比對系統")
-st.caption("上傳社創資料庫（A）、生命力新聞（B）、上一期結果（P），執行三期稽核比對分析。")
+st.caption("上傳社創資料庫（A）、生命力新聞（B）、上一期結果（P）、最初期結果（I），執行三期稽核比對分析。")
 
 tab_run, tab_history = st.tabs(["🔍 執行比對", "📁 歷史記錄"])
 
 # ── 執行比對 ──────────────────────────────────────────────
 with tab_run:
     st.subheader("上傳檔案")
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
-        st.markdown("**A 檔｜社創組織登錄資料庫（本期）**")
+        st.markdown("**A 檔｜社創組織登錄資料庫（本期）** ✱必填")
         file_a = st.file_uploader("上傳 A 檔 (.xlsx)", type=["xlsx"], key="fa")
     with col2:
-        st.markdown("**B 檔｜生命力新聞比對資料**")
+        st.markdown("**B 檔｜生命力新聞比對資料** ✱必填")
         file_b = st.file_uploader("上傳 B 檔 (.xlsx)", type=["xlsx"], key="fb_")
-    with col3:
-        st.markdown("**P 檔｜上一期比對結果** *(選填)*")
-        file_p = st.file_uploader("上傳 P 檔 (.xlsx)", type=["xlsx"], key="fp")
 
-    col_opt1, col_opt2 = st.columns([2, 1])
+    col3, col4 = st.columns(2)
+    with col3:
+        st.markdown("**P 檔｜上一期比對結果** *(選填，用於三期稽核)*")
+        file_p = st.file_uploader("上傳 P 檔 (.xlsx)", type=["xlsx"], key="fp")
+    with col4:
+        st.markdown("**I 檔｜最初期比對結果** *(選填，用於「初期是否出現」)*")
+        st.caption("未上傳時以 B 檔替代（原始行為）")
+        file_i = st.file_uploader("上傳 I 檔 (.xlsx)", type=["xlsx"], key="fi")
+
+    col_opt1, col_opt2, col_opt3 = st.columns(3)
     with col_opt1:
         label = st.text_input("本次比對標籤（如：115年3月）", placeholder="用於歷史記錄")
     with col_opt2:
         sheet_p = st.text_input("P 檔工作表名稱", value="02_精簡表(指定欄位)")
+    with col_opt3:
+        sheet_i = st.text_input("I 檔工作表名稱", value="02_精簡表(指定欄位)")
 
     run_btn = st.button("🚀 開始比對", type="primary",
                         disabled=(file_a is None or file_b is None),
@@ -432,13 +470,25 @@ with tab_run:
                                    "統一編號":"string","組織名稱2":"string"})
                     except Exception as e:
                         st.warning(f"P 檔讀取失敗，以無上期資料執行：{e}")
+
+                I_init = None
+                if file_i:
+                    try:
+                        si = sheet_i.strip() if sheet_i.strip() else 0
+                        I_init = pd.read_excel(file_i, sheet_name=si,
+                            dtype={"統一編號_final":"string","組織名稱2_final":"string",
+                                   "統一編號_x":"string","組織名稱2_x":"string",
+                                   "統一編號":"string","組織名稱2":"string"})
+                    except Exception as e:
+                        st.warning(f"I 檔讀取失敗，以 B 檔替代初期資料：{e}")
+
             except Exception as e:
                 st.error(f"讀取檔案錯誤：{e}")
                 st.stop()
 
         with st.spinner("執行比對分析中（資料量大時需 30–60 秒）..."):
             try:
-                sheets, stats, fdf = run_analysis(A, B, P_prev)
+                sheets, stats, fdf = run_analysis(A, B, P_prev, I_init)
             except Exception as e:
                 st.error(f"分析失敗：{e}")
                 st.stop()
@@ -454,6 +504,7 @@ with tab_run:
             "file_a":   file_a.name,
             "file_b":   file_b.name,
             "file_p":   file_p.name if file_p else "（無）",
+            "file_i":   file_i.name if file_i else "（以B檔替代）",
             "fname":    fname,
             "stats":    stats,
             "excel":    excel_bytes,   # bytes stored in session
@@ -509,6 +560,7 @@ with tab_history:
                     st.markdown(f"- **A 檔**：{rec['file_a']}")
                     st.markdown(f"- **B 檔**：{rec['file_b']}")
                     st.markdown(f"- **P 檔**：{rec['file_p']}")
+                    st.markdown(f"- **I 檔**：{rec.get('file_i','（以B檔替代）')}")
                 with c2:
                     s = rec["stats"]
                     st.markdown(f"- **總筆數**：{s['total']}")
