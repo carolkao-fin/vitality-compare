@@ -360,7 +360,13 @@ def _build_init_keys(df, tax_col=None, name_col=None):
     mask = keys.str.strip().ne("|") & keys.str.strip().ne("")
     return set(keys[mask])
 
-def run_analysis(A, B, P_prev):
+def run_analysis(A, B, P_prev, progress_cb=None):
+    STEPS = 9
+    def _prog(step, msg):
+        if progress_cb:
+            progress_cb(step / STEPS, msg)
+
+    _prog(1, "正規化欄位...")
     A.columns = [clean_col(c) for c in A.columns]
     B.columns = [clean_col(c) for c in B.columns]
 
@@ -387,6 +393,7 @@ def run_analysis(A, B, P_prev):
     B["KEY_init"] = B["K_tax"].fillna("") + "|" + B["K_name"].fillna("")
     init_keys = set(B["KEY_init"])
 
+    _prog(2, "建立上期 KEY 集合...")
     prev_keys = set()
     if P_prev is not None:
         P_prev.columns = [clean_col(c) for c in P_prev.columns]
@@ -403,6 +410,7 @@ def run_analysis(A, B, P_prev):
     A_len7 = list_len7(A); B_len7 = list_len7(B)
     A_pad  = pad8_list(A); B_pad  = pad8_list(B)
 
+    _prog(3, "執行嚴格比對（inner join）...")
     A_keyed = A.dropna(subset=["K_tax", "K_name2"]).copy()
     B_keyed = B.dropna(subset=["K_tax", "K_name2"]).copy()
     keep_inner = ["K_tax", "K_name", "K_name2"]
@@ -431,6 +439,7 @@ def run_analysis(A, B, P_prev):
     final_df = one2one[cols_03].copy().rename(columns={A_id: "統一編號", A_nm: "組織名稱2"})
     many_to_one = merged.copy()
 
+    _prog(4, "執行全量外連接（outer join）...")
     keep_outer = ["K_tax", "K_name"]
     A_tag = A.copy().rename(columns={c: f"{c}_new" for c in A.columns if c not in keep_outer})
     B_tag = B.copy().rename(columns={c: f"{c}_old" for c in B.columns if c not in keep_outer})
@@ -461,6 +470,7 @@ def run_analysis(A, B, P_prev):
         lambda r: coalesce(r.get("K_name2_x"), r.get("K_name2_y"), r.get("K_name2_new"), r.get("K_name2_old")), axis=1)
     full["本期是否出現"] = np.where(full["_merge"].isin(["both", "left_only"]), "本期有", "本期無")
 
+    _prog(5, "偵測異常（08/09 改名 / 錯編）...")
     t08 = full.dropna(subset=["K_tax"]).groupby("K_tax")["K_name2_co"].nunique(dropna=True).reset_index(name="d")
     tax_multi = set(t08.loc[t08["d"] > 1, "K_tax"].astype(str))
     full["08"] = np.where(full["K_tax"].astype(str).isin(tax_multi), "是", "否")
@@ -506,6 +516,7 @@ def run_analysis(A, B, P_prev):
     for c in ["08", "09", "10", "11"]:
         if c in full.columns: full.drop(columns=[c], inplace=True)
 
+    _prog(6, "三期分類（持續存在 / 歷史補回 / 本期新增）...")
     full["KEY"] = full["K_tax"].fillna("") + "|" + full["K_name"].fillna("")
     full["上一期有無"]   = np.where(full["KEY"].isin(prev_keys), "上一期有", "上一期無")
     full["初期是否出現"] = np.where(full["KEY"].isin(init_keys), "初期有", "初期無")
@@ -518,6 +529,7 @@ def run_analysis(A, B, P_prev):
     for c in ["社創組織資料庫_new", "社創平台網址上架網址_new", "生命力新聞_new"]:
         if c not in full.columns: full[c] = np.nan
 
+    _prog(7, "從 P 檔補值社創 / 生命力新聞欄位...")
     if P_prev is not None and "K_tax_prev" in P_prev.columns and "K_name_prev" in P_prev.columns:
         for bare_col, new_col in [
             ("社創組織資料庫",    "社創組織資料庫_new"),
@@ -535,6 +547,7 @@ def run_analysis(A, B, P_prev):
             full[new_col] = full[new_col].combine_first(full["_src"])
             full.drop(columns=["_src"], inplace=True, errors="ignore")
 
+    _prog(8, "產生精簡表...")
     full["組織名稱2_fb"]  = full.apply(lambda r: fb(r,"組織名稱2_x","組織名稱2_y","組織名稱_old"), axis=1)
     full["統一編號_fb"]   = full.apply(lambda r: fb(r,"統一編號_x","統一編號_y"), axis=1)
     full["負責人2_fb"]    = full.apply(lambda r: fb(r,"負責人2_new","負責人2_old"), axis=1)
@@ -569,6 +582,7 @@ def run_analysis(A, B, P_prev):
         "社創平台網址上架網址_fb":"社創平台網址上架網址","生命力新聞_fb":"生命力新聞","K_name2_fb":"K_name2"})
     fdf = fdf.sort_values("排序2_new", ascending=True, na_position="last").reset_index(drop=True)
 
+    _prog(9, "彙整各工作表...")
     Au  = A_keyed.merge(B_keyed,on=["K_tax","K_name2"],how="left",indicator=True)
     Au  = Au.loc[Au["_merge"].eq("left_only")].drop(columns=["_merge"])
     Bu  = B_keyed.merge(A_keyed,on=["K_tax","K_name2"],how="left",indicator=True)
@@ -834,12 +848,23 @@ with tab_compare:
                 st.error(f"讀取檔案錯誤：{e}")
                 st.stop()
 
-        with st.spinner("執行比對分析中（資料量大時需 30–60 秒）..."):
-            try:
-                sheets, stats, fdf = run_analysis(A, B, P_prev)
-            except Exception as e:
-                st.error(f"分析失敗：{e}")
-                st.stop()
+        prog_bar  = st.progress(0, text="準備中...")
+        prog_text = st.empty()
+
+        def _analysis_progress(pct, msg):
+            prog_bar.progress(pct, text=msg)
+            prog_text.caption(f"步驟 {round(pct * 9)}/9：{msg}")
+
+        try:
+            sheets, stats, fdf = run_analysis(A, B, P_prev, progress_cb=_analysis_progress)
+        except Exception as e:
+            prog_bar.empty()
+            prog_text.empty()
+            st.error(f"分析失敗：{e}")
+            st.stop()
+
+        prog_bar.progress(1.0, text="完成！")
+        prog_text.empty()
 
         excel_bytes = make_excel(sheets)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
