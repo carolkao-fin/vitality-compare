@@ -6,7 +6,6 @@ import unicodedata
 import re
 from datetime import datetime
 from io import BytesIO
-import base64
 
 st.set_page_config(
     page_title="生命力比對系統",
@@ -106,20 +105,246 @@ def fb(r, new_col, *old_cols):
             return v
     return np.nan
 
+def make_excel(sheets):
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for name, df in sheets.items():
+            df.to_excel(w, index=False, sheet_name=name[:31])
+    return buf.getvalue()
+
 # =========================================================
-# 主分析函式
+# Step 1：文章去重
+# =========================================================
+def run_dedup(df):
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    if "article_title" not in df.columns:
+        raise ValueError("找不到 'article_title' 欄位")
+    if "url" not in df.columns:
+        raise ValueError("找不到 'url' 欄位")
+
+    df["article_title"] = df["article_title"].astype(str).str.strip().str.lower()
+    df["url"] = df["url"].astype(str).str.strip().str.lower()
+
+    dupe_stats = (
+        df.groupby(["article_title", "url"])
+        .size()
+        .reset_index(name="duplicate_count")
+        .sort_values(by="duplicate_count", ascending=False)
+    )
+    df_unique = df.drop_duplicates(subset=["article_title", "url"], keep="first")
+    df_dupes  = dupe_stats[dupe_stats["duplicate_count"] > 1]
+
+    return df_unique, df_dupes, len(df)
+
+# =========================================================
+# Step 2：文字探勘（網路爬蟲 + jieba）
+# =========================================================
+def _make_session():
+    import requests
+    from urllib3.util.retry import Retry
+    from requests.adapters import HTTPAdapter
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    s = requests.Session()
+    retries = Retry(
+        total=3, connect=2, read=2, backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+    )
+    s.headers.update({"User-Agent": UA})
+    s.mount("http://",  HTTPAdapter(max_retries=retries))
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    return s
+
+def _fetch_one(session, url, timeout=5):
+    import html as htmllib
+    from bs4 import BeautifulSoup
+    try:
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
+        try:
+            if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "ascii"):
+                resp.encoding = resp.apparent_encoding or "utf-8"
+        except Exception:
+            pass
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        title = ""
+        h1 = soup.find("h1")
+        if h1 and h1.get_text(strip=True):
+            title = h1.get_text(strip=True)
+        else:
+            og = soup.find("meta", property="og:title")
+            if og and og.get("content"):
+                title = og.get("content").strip()
+            elif soup.title and soup.title.string:
+                title = soup.title.string.strip()
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        all_text = soup.get_text("\n")
+        all_text = re.sub(r"\n{2,}", "\n", all_text).strip()
+        return title, all_text, ""
+    except Exception as e:
+        return "", "", repr(e)
+
+def _parse_date(text):
+    import html as htmllib
+    s = htmllib.unescape(str(text))
+    m = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", s)
+    if m: return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+    m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m: return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+    m = re.search(r"(20\d{6})", s)
+    if m: return m.group(1)
+    return None
+
+ORG_KEYWORDS = [
+    "協會","基金會","中心","學會","學校","大學","研究院","公司",
+    "球隊","俱樂部","體育館","公園","委員會","工作室","團隊",
+    "中華隊","奧運","帕運","亞帕運","公開賽","平台","計畫","計劃"
+]
+ORG_REGEX   = re.compile(r"([一-龥A-Za-z0-9．／\-\s]{2,20}?(?:" + "|".join(ORG_KEYWORDS) + r"))")
+PLAN_REGEX  = re.compile(r"([一-龥A-Za-z0-9]{2,20}(?:計畫|方案|行動|策略|平台))")
+
+def _extract_persons(text):
+    names  = re.findall(r"([一-龥]{2,3})(?:(?:表示|提到|說|指出|加入|帶領))", text or "")
+    names += re.findall(r"([一-龥]{2,3})：「", text or "")
+    names += re.findall(r"(?:學員|選手|教練|記者)([一-龥]{2,3})", text or "")
+    blacklist = {"台北","臺北","台灣","臺灣","巴黎","雅典","澳洲","新北","板橋"}
+    out, seen = [], set()
+    for n in names:
+        if n not in blacklist and n not in seen:
+            out.append(n); seen.add(n)
+    return out
+
+def _extract_orgs(text):
+    orgs = ORG_REGEX.findall(text or "")
+    out, seen = [], set()
+    for o in orgs:
+        o2 = re.sub(r"\s+", "", o)
+        if o2 and o2 not in seen:
+            out.append(o2); seen.add(o2)
+    return out
+
+def _extract_plans(text):
+    plans = PLAN_REGEX.findall(text or "")
+    out, seen = [], set()
+    for p in plans:
+        if p and p not in seen:
+            out.append(p); seen.add(p)
+    return out
+
+def _jieba_keywords(text, topk=15, use_textrank=True):
+    import jieba.analyse
+    if not text:
+        return []
+    tfidf = jieba.analyse.extract_tags(text, topK=topk, withWeight=False) or []
+    tr = []
+    if use_textrank:
+        try:
+            tr = jieba.analyse.textrank(text, topK=topk, withWeight=False) or []
+        except Exception:
+            tr = []
+    combined = list(dict.fromkeys(tfidf + tr))
+    return [w.strip() for w in combined if len(w.strip()) >= 2]
+
+def run_text_mining(df, max_workers=6, timeout_sec=5, topk=15, use_textrank=True,
+                    progress_cb=None):
+    """
+    df 需有 url 欄位，article_title 欄位選填。
+    progress_cb: callable(current, total) 用於回報進度。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import jieba  # noqa: ensure jieba is loaded
+
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "url" not in df.columns:
+        raise ValueError("找不到 'url' 欄位")
+    if "article_title" not in df.columns:
+        df["article_title"] = ""
+
+    df = df.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
+    urls = df["url"].astype(str).str.strip().tolist()
+    n = len(urls)
+
+    # 併發爬取
+    session = _make_session()
+    res_title = [None] * n
+    res_text  = [None] * n
+    res_err   = [None] * n
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {ex.submit(_fetch_one, session, u, timeout_sec): i
+                      for i, u in enumerate(urls)}
+        done = 0
+        for fut in as_completed(future_map):
+            i = future_map[fut]
+            res_title[i], res_text[i], res_err[i] = fut.result()
+            done += 1
+            if progress_cb:
+                progress_cb(done, n)
+
+    # 解析與關鍵字
+    parsed_dates, final_titles = [], []
+    jieba_cols, rule_cols, merged_cols = [], [], []
+    content_len_col, raw_preview_col   = [], []
+
+    for i, u in enumerate(urls):
+        raw_title  = str(df.at[i, "article_title"] or "").strip()
+        page_title = res_title[i] or ""
+        text_full  = res_text[i]  or ""
+        final_title = raw_title or page_title
+        final_titles.append(final_title)
+
+        date_str = (_parse_date(text_full) or _parse_date(final_title) or
+                    _parse_date(u) or "unknown")
+        parsed_dates.append(date_str)
+
+        full_text_for_kw = f"{final_title}\n{text_full}"
+        jieba_kw = _jieba_keywords(full_text_for_kw, topk=topk, use_textrank=use_textrank)
+        persons  = _extract_persons(full_text_for_kw)
+        orgs     = _extract_orgs(full_text_for_kw)
+        plans    = _extract_plans(full_text_for_kw)
+
+        rule_kw = list(dict.fromkeys(persons + orgs + plans))
+        merged  = list(dict.fromkeys(jieba_kw + rule_kw))
+
+        jieba_cols.append("、".join(jieba_kw))
+        rule_cols.append("、".join(rule_kw))
+        merged_cols.append("、".join(merged))
+        content_len_col.append(len(text_full))
+        raw_preview_col.append(text_full[:120].replace("\n", " "))
+
+    df["article_title"] = final_titles
+    df["parsed_date"]   = parsed_dates
+
+    counters, article_ids = {}, []
+    for date_str in df["parsed_date"]:
+        counters[date_str] = counters.get(date_str, 0) + 1
+        article_ids.append(f"vita_{date_str}_{counters[date_str]}")
+    df["article_id"]    = article_ids
+    df["jieba_keywords"] = jieba_cols
+    df["rule_keywords"]  = rule_cols
+    df["keywords"]       = merged_cols
+    df["fetch_error"]    = res_err
+    df["content_chars"]  = content_len_col
+    df["raw_preview"]    = raw_preview_col
+
+    return df
+
+# =========================================================
+# Step 3：比對分析
 # =========================================================
 def _find_prev_col(P_prev, bare_col, new_col):
-    """從 P 檔找補值欄位：先找完全符合，再找相同前綴的變體（如 生命力新聞_new_match）"""
     for name in [bare_col, new_col]:
         if name in P_prev.columns:
             return name
-    # 前綴比對：找所有以 bare_col 開頭的欄位，取第一個
     matches = [c for c in P_prev.columns if c.startswith(bare_col)]
     return matches[0] if matches else None
 
 def _build_init_keys(df, tax_col=None, name_col=None):
-    """從初期檔建立 KEY set，兼容多種欄位命名"""
     df = df.copy()
     df.columns = [clean_col(c) for c in df.columns]
     t = tax_col or pick(df, ["統一編號_final","統一編號_x","統一編號"]) or find_tax_col(df)
@@ -158,14 +383,12 @@ def run_analysis(A, B, P_prev, I_init=None):
     B["K_name"]  = B[name_col_B].map(norm_name)
     B["K_name2"] = B[name_col_B].map(norm_name_strong)
 
-    # init_keys：有上傳最初期比對結果時從該檔建立，否則以 B 檔代替
     if I_init is not None:
         init_keys = _build_init_keys(I_init)
     else:
         B["KEY_init"] = B["K_tax"].fillna("") + "|" + B["K_name"].fillna("")
         init_keys = set(B["KEY_init"])
 
-    # 上一期
     prev_keys = set()
     if P_prev is not None:
         P_prev.columns = [clean_col(c) for c in P_prev.columns]
@@ -182,7 +405,6 @@ def run_analysis(A, B, P_prev, I_init=None):
     A_len7 = list_len7(A); B_len7 = list_len7(B)
     A_pad  = pad8_list(A); B_pad  = pad8_list(B)
 
-    # 嚴格比對
     A_keyed = A.dropna(subset=["K_tax", "K_name2"]).copy()
     B_keyed = B.dropna(subset=["K_tax", "K_name2"]).copy()
     keep_inner = ["K_tax", "K_name", "K_name2"]
@@ -211,7 +433,6 @@ def run_analysis(A, B, P_prev, I_init=None):
     final_df = one2one[cols_03].copy().rename(columns={A_id: "統一編號", A_nm: "組織名稱2"})
     many_to_one = merged.copy()
 
-    # 全量外連接
     keep_outer = ["K_tax", "K_name"]
     A_tag = A.copy().rename(columns={c: f"{c}_new" for c in A.columns if c not in keep_outer})
     B_tag = B.copy().rename(columns={c: f"{c}_old" for c in B.columns if c not in keep_outer})
@@ -242,7 +463,6 @@ def run_analysis(A, B, P_prev, I_init=None):
         lambda r: coalesce(r.get("K_name2_x"), r.get("K_name2_y"), r.get("K_name2_new"), r.get("K_name2_old")), axis=1)
     full["本期是否出現"] = np.where(full["_merge"].isin(["both", "left_only"]), "本期有", "本期無")
 
-    # 08/09
     t08 = full.dropna(subset=["K_tax"]).groupby("K_tax")["K_name2_co"].nunique(dropna=True).reset_index(name="d")
     tax_multi = set(t08.loc[t08["d"] > 1, "K_tax"].astype(str))
     full["08"] = np.where(full["K_tax"].astype(str).isin(tax_multi), "是", "否")
@@ -251,7 +471,6 @@ def run_analysis(A, B, P_prev, I_init=None):
     name_multi = set(t09.loc[t09["d"] > 1, "K_name2_co"].astype(str))
     full["09"] = np.where(full["K_name2_co"].astype(str).isin(name_multi), "是", "否")
 
-    # 10/11
     prev_tn = pd.DataFrame(columns=["K_tax", "K_name"])
     if P_prev is not None:
         prev_tn = (P_prev.dropna(subset=["K_tax_prev", "K_name_prev"])[["K_tax_prev", "K_name_prev"]]
@@ -289,7 +508,6 @@ def run_analysis(A, B, P_prev, I_init=None):
     for c in ["08", "09", "10", "11"]:
         if c in full.columns: full.drop(columns=[c], inplace=True)
 
-    # 三期分類
     full["KEY"] = full["K_tax"].fillna("") + "|" + full["K_name"].fillna("")
     full["上一期有無"]   = np.where(full["KEY"].isin(prev_keys), "上一期有", "上一期無")
     full["初期是否出現"] = np.where(full["KEY"].isin(init_keys), "初期有", "初期無")
@@ -302,8 +520,6 @@ def run_analysis(A, B, P_prev, I_init=None):
     for c in ["社創組織資料庫_new", "社創平台網址上架網址_new", "生命力新聞_new"]:
         if c not in full.columns: full[c] = np.nan
 
-    # 從 P 檔補值社創/生命力新聞三欄
-    # 用 _find_prev_col 兼容多種命名變體，包含 生命力新聞_new_match 等
     if P_prev is not None and "K_tax_prev" in P_prev.columns and "K_name_prev" in P_prev.columns:
         for bare_col, new_col in [
             ("社創組織資料庫",    "社創組織資料庫_new"),
@@ -321,7 +537,6 @@ def run_analysis(A, B, P_prev, I_init=None):
             full[new_col] = full[new_col].combine_first(full["_src"])
             full.drop(columns=["_src"], inplace=True, errors="ignore")
 
-    # 02_精簡表
     full["組織名稱2_fb"]  = full.apply(lambda r: fb(r,"組織名稱2_x","組織名稱2_y","組織名稱_old"), axis=1)
     full["統一編號_fb"]   = full.apply(lambda r: fb(r,"統一編號_x","統一編號_y"), axis=1)
     full["負責人2_fb"]    = full.apply(lambda r: fb(r,"負責人2_new","負責人2_old"), axis=1)
@@ -394,30 +609,181 @@ def run_analysis(A, B, P_prev, I_init=None):
     }
     return sheets, stats, fdf
 
-def make_excel(sheets):
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        for name, df in sheets.items():
-            df.to_excel(w, index=False, sheet_name=name[:31])
-    return buf.getvalue()
-
 # =========================================================
 # Session State 初始化
 # =========================================================
 if "history" not in st.session_state:
-    st.session_state.history = []   # list of dicts
+    st.session_state.history = []
 
 # =========================================================
-# UI
+# UI — 4 個 Tab
 # =========================================================
 st.title("📊 生命力比對系統")
-st.caption("上傳社創資料庫（A）、生命力新聞（B）、上一期結果（P）、最初期結果（I），執行三期稽核比對分析。")
+st.caption("整合三個工作流程：文章去重 → 文字探勘 → 比對分析")
 
-tab_run, tab_history = st.tabs(["🔍 執行比對", "📁 歷史記錄"])
+tab_dedup, tab_mining, tab_compare, tab_history = st.tabs([
+    "📰 Step 1：文章去重",
+    "🔍 Step 2：文字探勘",
+    "📊 Step 3：比對分析",
+    "📁 歷史記錄",
+])
 
-# ── 執行比對 ──────────────────────────────────────────────
-with tab_run:
-    st.subheader("上傳檔案")
+# ── Step 1：文章去重 ───────────────────────────────────────
+with tab_dedup:
+    st.subheader("文章去重（依 article_title + url 去除重複）")
+    st.markdown("""
+    **輸入格式**：Excel 檔，需包含 `article_title` 和 `url` 兩個欄位。
+    **輸出**：去重後唯一文章（unique_articles）＋重複清單（duplicates_summary）。
+    """)
+
+    dedup_file = st.file_uploader("上傳文章 Excel (.xlsx)", type=["xlsx"], key="dedup_file")
+    dedup_sheet = st.text_input("工作表名稱（留空則自動偵測）", value="", key="dedup_sheet",
+                                placeholder="links / 工作表1 / 留空自動")
+
+    if st.button("🚀 開始去重", type="primary", disabled=(dedup_file is None),
+                 use_container_width=True, key="dedup_run"):
+        with st.spinner("讀取並去重中..."):
+            try:
+                sn = dedup_sheet.strip() if dedup_sheet.strip() else 0
+                try:
+                    df_in = pd.read_excel(dedup_file, sheet_name=sn)
+                except Exception:
+                    dedup_file.seek(0)
+                    xf = pd.ExcelFile(dedup_file)
+                    fallback = "unique_articles" if "unique_articles" in xf.sheet_names else xf.sheet_names[0]
+                    dedup_file.seek(0)
+                    df_in = pd.read_excel(dedup_file, sheet_name=fallback)
+
+                df_unique, df_dupes, total = run_dedup(df_in)
+
+                st.success(f"去重完成！原始 {total} 筆 → 唯一 {len(df_unique)} 筆，重複組合 {len(df_dupes)} 組")
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("原始筆數", total)
+                m2.metric("去重後筆數", len(df_unique))
+                m3.metric("移除重複筆數", total - len(df_unique))
+
+                if not df_dupes.empty:
+                    st.markdown("**重複組合預覽（前 20 組）**")
+                    st.dataframe(df_dupes.head(20), use_container_width=True, hide_index=True)
+
+                # 產生下載 Excel
+                buf = BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                    df_unique.to_excel(w, sheet_name="unique_articles", index=False)
+                    df_dupes.to_excel(w, sheet_name="duplicates_summary", index=False)
+                fname_dedup = f"articles_dedup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+                st.download_button(
+                    label="⬇️ 下載去重結果 Excel",
+                    data=buf.getvalue(),
+                    file_name=fname_dedup,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"去重失敗：{e}")
+
+# ── Step 2：文字探勘 ───────────────────────────────────────
+with tab_mining:
+    st.subheader("文字探勘（網路爬蟲 + jieba TF-IDF / TextRank）")
+    st.markdown("""
+    **輸入格式**：Excel 檔，需有 `url` 欄位（`article_title` 選填）。
+    建議先執行 Step 1 去重後再上傳。
+    **輸出欄位**：`article_title`、`parsed_date`、`article_id`、`jieba_keywords`、
+    `rule_keywords`、`keywords`、`fetch_error`、`content_chars`、`raw_preview`
+    """)
+
+    st.warning(
+        "網路爬蟲速度依文章數量和網路狀況而定，1,400 篇約需 3–5 分鐘（爬取）+ 最長 90 分鐘（jieba 分析）。"
+        "請勿關閉視窗。建議在本機執行大量資料；Streamlit Cloud 有連線逾時風險。",
+        icon="⏱️",
+    )
+
+    mining_file   = st.file_uploader("上傳文章 Excel (.xlsx)", type=["xlsx"], key="mining_file")
+    mining_sheet  = st.text_input("工作表名稱（留空則自動偵測）", value="", key="mining_sheet",
+                                  placeholder="links / unique_articles / 留空自動")
+
+    col_m1, col_m2, col_m3 = st.columns(3)
+    with col_m1:
+        max_workers = st.number_input("爬蟲平行執行緒數", min_value=1, max_value=20, value=6)
+    with col_m2:
+        timeout_sec = st.number_input("單篇爬取逾時（秒）", min_value=3, max_value=30, value=5)
+    with col_m3:
+        topk = st.number_input("jieba 關鍵字數上限（topK）", min_value=5, max_value=50, value=15)
+    use_textrank = st.checkbox("同時使用 TextRank（較慢，關鍵字更豐富）", value=True)
+
+    if st.button("🚀 開始文字探勘", type="primary", disabled=(mining_file is None),
+                 use_container_width=True, key="mining_run"):
+
+        # 讀取檔案
+        try:
+            sn = mining_sheet.strip() if mining_sheet.strip() else 0
+            try:
+                df_in = pd.read_excel(mining_file, sheet_name=sn)
+                used_sheet = sn if sn != 0 else "（第一個工作表）"
+            except Exception:
+                mining_file.seek(0)
+                xf = pd.ExcelFile(mining_file)
+                fallback = "unique_articles" if "unique_articles" in xf.sheet_names else xf.sheet_names[0]
+                mining_file.seek(0)
+                df_in = pd.read_excel(mining_file, sheet_name=fallback)
+                used_sheet = fallback
+            st.info(f"使用工作表：{used_sheet}，共 {len(df_in)} 筆")
+        except Exception as e:
+            st.error(f"讀取失敗：{e}")
+            st.stop()
+
+        # 進度顯示
+        progress_bar  = st.progress(0, text="爬取中 (0 / ?)")
+        status_text   = st.empty()
+
+        def update_progress(done, total):
+            pct = done / total if total > 0 else 0
+            progress_bar.progress(pct, text=f"爬取中 ({done} / {total})")
+
+        with st.spinner("執行文字探勘中，請耐心等候..."):
+            try:
+                result_df = run_text_mining(
+                    df_in,
+                    max_workers=int(max_workers),
+                    timeout_sec=int(timeout_sec),
+                    topk=int(topk),
+                    use_textrank=use_textrank,
+                    progress_cb=update_progress,
+                )
+            except Exception as e:
+                st.error(f"文字探勘失敗：{e}")
+                st.stop()
+
+        progress_bar.progress(1.0, text="完成！")
+        unknown_ct = int((result_df["parsed_date"] == "unknown").sum())
+        err_ct     = int(result_df["fetch_error"].astype(bool).sum())
+        st.success(f"文字探勘完成！共 {len(result_df)} 篇，未知日期 {unknown_ct} 篇，爬取失敗 {err_ct} 篇")
+
+        preview_cols = [c for c in ["article_title","parsed_date","article_id","keywords","fetch_error"]
+                        if c in result_df.columns]
+        st.markdown("**預覽（前 20 筆）**")
+        st.dataframe(result_df[preview_cols].head(20), use_container_width=True, hide_index=True)
+
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            result_df.to_excel(w, sheet_name="links", index=False)
+        fname_mining = f"articles_with_keywords_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        st.download_button(
+            label="⬇️ 下載文字探勘結果 Excel",
+            data=buf.getvalue(),
+            file_name=fname_mining,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+# ── Step 3：比對分析 ───────────────────────────────────────
+with tab_compare:
+    st.subheader("比對分析（A × B × P 三期稽核）")
+    st.caption("上傳社創資料庫（A）、生命力新聞（B）、上一期結果（P）、最初期結果（I），執行三期稽核比對分析。")
+
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**A 檔｜社創組織登錄資料庫（本期）** ✱必填")
@@ -495,31 +861,30 @@ with tab_run:
 
         excel_bytes = make_excel(sheets)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        fname = f"比對結果_{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx" if label else f"比對結果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        fname = (f"比對結果_{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                 if label else f"比對結果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
 
-        # 存入 session_state 歷史
         st.session_state.history.insert(0, {
-            "label":    label or "（未命名）",
-            "ts":       ts,
-            "file_a":   file_a.name,
-            "file_b":   file_b.name,
-            "file_p":   file_p.name if file_p else "（無）",
-            "file_i":   file_i.name if file_i else "（以B檔替代）",
-            "fname":    fname,
-            "stats":    stats,
-            "excel":    excel_bytes,   # bytes stored in session
+            "label":  label or "（未命名）",
+            "ts":     ts,
+            "file_a": file_a.name,
+            "file_b": file_b.name,
+            "file_p": file_p.name if file_p else "（無）",
+            "file_i": file_i.name if file_i else "（以B檔替代）",
+            "fname":  fname,
+            "stats":  stats,
+            "excel":  excel_bytes,
         })
 
         st.success("✅ 比對完成！")
 
-        # 統計指標
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("總筆數",       stats["total"])
-        m2.metric("名稱空值",     stats["name_null"])
-        m3.metric("K_name 空值",  stats["kname_null"])
-        m4.metric("08 疑似改名",  stats["rename_08"])
-        m5.metric("09 疑似錯編",  stats["taxerr_09"])
-        m6.metric("上期 KEY 數",  stats["prev_keys"])
+        m1.metric("總筆數",      stats["total"])
+        m2.metric("名稱空值",    stats["name_null"])
+        m3.metric("K_name 空值", stats["kname_null"])
+        m4.metric("08 疑似改名", stats["rename_08"])
+        m5.metric("09 疑似錯編", stats["taxerr_09"])
+        m6.metric("上期 KEY 數", stats["prev_keys"])
 
         ca, cb = st.columns(2)
         with ca:
@@ -533,7 +898,9 @@ with tab_run:
             st.dataframe(pd.DataFrame({"類型": list(mc.keys()), "筆數": list(mc.values())}),
                          use_container_width=True, hide_index=True)
 
-        preview_cols = [c for c in ["組織名稱2","統一編號","縣市","新增分類","上一期有無","初期是否出現","改名_三期彙整","統編異常_三期彙整"] if c in fdf.columns]
+        preview_cols = [c for c in ["組織名稱2","統一編號","縣市","新增分類","上一期有無",
+                                    "初期是否出現","改名_三期彙整","統編異常_三期彙整"]
+                        if c in fdf.columns]
         st.markdown("**🔎 02_精簡表 預覽（前 50 筆）**")
         st.dataframe(fdf[preview_cols].head(50), use_container_width=True, hide_index=True)
 
