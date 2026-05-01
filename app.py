@@ -4,8 +4,41 @@ import pandas as pd
 import numpy as np
 import unicodedata
 import re
+import os
+import json
 from datetime import datetime
 from io import BytesIO
+
+# =========================================================
+# 持久化歷史記錄（JSON，不含 Excel 檔案）
+# =========================================================
+_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history_log.json")
+_HISTORY_MAX  = 200   # 最多保留筆數
+
+def _load_history_log():
+    try:
+        if os.path.exists(_HISTORY_FILE):
+            with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+def _save_history_log(records):
+    try:
+        with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(records[:_HISTORY_MAX], f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _append_to_log(rec):
+    """將一筆記錄（不含 excel bytes）寫入 JSON 歷史檔。"""
+    entry = {k: v for k, v in rec.items() if k != "excel"}
+    log = _load_history_log()
+    # 避免同一 ts 重複寫入（同一次執行觸發多次 rerun）
+    if not log or log[0].get("ts") != entry.get("ts"):
+        log.insert(0, entry)
+        _save_history_log(log)
 
 st.set_page_config(
     page_title="生命力比對系統",
@@ -864,7 +897,9 @@ def run_analysis(A, B, P_prev, progress_cb=None):
 # Session State 初始化
 # =========================================================
 if "history" not in st.session_state:
-    st.session_state.history = []
+    st.session_state.history = []          # 本次工作階段（含 Excel bytes）
+if "history_log" not in st.session_state:
+    st.session_state.history_log = _load_history_log()  # 跨階段持久記錄（無 Excel）
 
 # =========================================================
 # Step 5：格式修正（統編補零 + 手機格式）
@@ -1130,14 +1165,17 @@ with tab_dedup:
                     df_dupes.to_excel(w, sheet_name="duplicates_summary", index=False)
                 fname_dedup = f"articles_dedup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 dedup_bytes = buf.getvalue()
-                st.session_state.history.insert(0, {
+                _rec1 = {
                     "step":        "Step 1 文章去重",
                     "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "input_files": [dedup_file.name],
                     "results":     {"原始筆數": total, "去重後筆數": len(df_unique), "重複組合數": len(df_dupes)},
                     "fname":       fname_dedup,
                     "excel":       dedup_bytes,
-                })
+                }
+                st.session_state.history.insert(0, _rec1)
+                _append_to_log(_rec1)
+                st.session_state.history_log = _load_history_log()
 
                 st.download_button(
                     label="⬇️ 下載去重結果 Excel",
@@ -1239,14 +1277,17 @@ with tab_mining:
             result_df.to_excel(w, sheet_name="links", index=False)
         fname_mining  = f"articles_with_keywords_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         mining_bytes  = buf.getvalue()
-        st.session_state.history.insert(0, {
+        _rec2 = {
             "step":        "Step 2 文字探勘",
             "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "input_files": [mining_file.name],
             "results":     {"文章總數": len(result_df), "未知日期": unknown_ct, "爬取失敗": err_ct},
             "fname":       fname_mining,
             "excel":       mining_bytes,
-        })
+        }
+        st.session_state.history.insert(0, _rec2)
+        _append_to_log(_rec2)
+        st.session_state.history_log = _load_history_log()
 
         st.download_button(
             label="⬇️ 下載文字探勘結果 Excel",
@@ -1390,7 +1431,7 @@ with tab_match:
             df_report.to_excel(w, sheet_name="比對結果整理", index=False)
         fname_match  = f"比對結果_更新後_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         match_bytes  = buf.getvalue()
-        st.session_state.history.insert(0, {
+        _rec4 = {
             "step":        "Step 4 文章比對",
             "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "input_files": [match_kw_file.name, match_main_file.name],
@@ -1398,7 +1439,10 @@ with tab_match:
                             "文章命中篇數": art_hit, "文章總數": len(df_report)},
             "fname":       fname_match,
             "excel":       match_bytes,
-        })
+        }
+        st.session_state.history.insert(0, _rec4)
+        _append_to_log(_rec4)
+        st.session_state.history_log = _load_history_log()
 
         st.download_button(
             label="⬇️ 下載文章比對結果 Excel",
@@ -1489,22 +1533,25 @@ with tab_compare:
                  if label else f"比對結果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
 
         nc = stats["new_class"]
-        st.session_state.history.insert(0, {
+        _rec3 = {
             "step":        "Step 3 比對分析",
             "ts":          ts,
             "label":       label or "",
             "input_files": [file_a.name, file_b.name] + ([file_p.name] if file_p else []),
             "results":     {
-                "總筆數":     stats["total"],
-                "持續存在":   nc.get("持續存在", 0),
-                "歷史補回":   nc.get("歷史補回", 0),
+                "總筆數":      stats["total"],
+                "持續存在":    nc.get("持續存在", 0),
+                "歷史補回":    nc.get("歷史補回", 0),
                 "本期真正新增": nc.get("本期真正新增", 0),
                 "08 疑似改名": stats["rename_08"],
                 "09 疑似錯編": stats["taxerr_09"],
             },
             "fname":       fname,
             "excel":       excel_bytes,
-        })
+        }
+        st.session_state.history.insert(0, _rec3)
+        _append_to_log(_rec3)
+        st.session_state.history_log = _load_history_log()
 
         st.success("✅ 比對完成！")
 
@@ -1596,14 +1643,17 @@ with tab_fmt:
                     st.write(line)
 
             fname_fmt = f"比對結果_修正後_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            st.session_state.history.insert(0, {
+            _rec5 = {
                 "step":        "Step 5 格式修正",
                 "ts":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "input_files": [fmt_file.name],
                 "results":     {"處理工作表數": len(fixed_dict), "修正欄位項目": len(log)},
                 "fname":       fname_fmt,
                 "excel":       excel_bytes,
-            })
+            }
+            st.session_state.history.insert(0, _rec5)
+            _append_to_log(_rec5)
+            st.session_state.history_log = _load_history_log()
 
             st.download_button(
                 label="⬇️ 下載格式修正後 Excel",
@@ -1616,57 +1666,92 @@ with tab_fmt:
 # ── 歷史記錄 ──────────────────────────────────────────────
 with tab_history:
     st.subheader("執行記錄")
-    st.caption("⚠️ 記錄僅保留於目前瀏覽器工作階段，重新整理頁面後會清除。請及時下載 Excel。")
+    st.caption(
+        "📌 **執行時間與結果**永久保存於本機 JSON 檔（`history_log.json`）。"
+        "Excel 檔案僅在本次工作階段可下載，重新整理頁面後消失。"
+    )
 
-    if not st.session_state.history:
-        st.info("尚無記錄，執行任一步驟後自動出現。")
-    else:
-        # 全部清除按鈕
-        if st.button("🗑️ 清除所有記錄", type="secondary"):
-            st.session_state.history = []
-            st.rerun()
+    STEP_ICON = {
+        "Step 1 文章去重": "📰",
+        "Step 2 文字探勘": "🔍",
+        "Step 3 比對分析": "📊",
+        "Step 4 文章比對": "🔗",
+        "Step 5 格式修正": "🔧",
+    }
 
-        STEP_ICON = {
-            "Step 1 文章去重":  "📰",
-            "Step 2 文字探勘":  "🔍",
-            "Step 3 比對分析":  "📊",
-            "Step 4 文章比對":  "🔗",
-            "Step 5 格式修正":  "🔧",
-        }
+    def _render_rec(rec, idx, show_download=False, key_prefix=""):
+        step  = rec.get("step", "記錄")
+        icon  = STEP_ICON.get(step, "🗂️")
+        label = rec.get("label", "")
+        title = f"{icon} {rec['ts']}　{step}" + (f"　｜　{label}" if label else "")
 
-        for i, rec in enumerate(st.session_state.history):
-            step  = rec.get("step", "Step 3 比對分析")
-            icon  = STEP_ICON.get(step, "🗂️")
-            label = rec.get("label", "")
-            title = f"{icon} {rec['ts']}　{step}" + (f"　｜　{label}" if label else "")
+        with st.expander(title, expanded=(idx == 0)):
+            col_info, col_del = st.columns([5, 1])
+            with col_info:
+                st.markdown(f"**執行時間**：`{rec['ts']}`")
+                files = rec.get("input_files", [])
+                if files:
+                    st.markdown("**輸入檔案**：" + "、".join(files))
+            with col_del:
+                if st.button("🗑️ 刪除", key=f"{key_prefix}del_{idx}", use_container_width=True):
+                    return "delete"
 
-            with st.expander(title, expanded=(i == 0)):
-                # ── 日期時間 + 輸入檔
-                col_info, col_del = st.columns([5, 1])
-                with col_info:
-                    st.markdown(f"**執行時間**：`{rec['ts']}`")
-                    files = rec.get("input_files", [])
-                    if files:
-                        st.markdown("**輸入檔案**：" + "、".join(files))
-                with col_del:
-                    if st.button("🗑️ 刪除", key=f"del_{i}", use_container_width=True):
-                        st.session_state.history.pop(i)
-                        st.rerun()
+            results = rec.get("results", {})
+            if results:
+                st.markdown("**執行結果**")
+                cols = st.columns(min(len(results), 4))
+                for j, (k, v) in enumerate(results.items()):
+                    cols[j % 4].metric(k, v)
 
-                # ── 執行結果（以 metric 顯示）
-                results = rec.get("results", {})
-                if results:
-                    st.markdown("**執行結果**")
-                    cols = st.columns(min(len(results), 4))
-                    for j, (k, v) in enumerate(results.items()):
-                        cols[j % 4].metric(k, v)
-
-                # ── 下載按鈕
+            if show_download and rec.get("excel"):
                 st.download_button(
-                    label=f"⬇️ 下載 {rec['fname']}",
+                    label=f"⬇️ 下載 {rec.get('fname', 'output.xlsx')}",
                     data=rec["excel"],
-                    file_name=rec["fname"],
+                    file_name=rec.get("fname", "output.xlsx"),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{i}",
+                    key=f"{key_prefix}dl_{idx}",
                     use_container_width=True,
                 )
+            elif not show_download:
+                st.caption("（此為過去記錄，Excel 檔案已無法下載）")
+        return None
+
+    # ── 本次工作階段 ──────────────────
+    st.markdown("### 本次工作階段")
+    if not st.session_state.history:
+        st.info("本次尚未執行任何步驟。")
+    else:
+        if st.button("🗑️ 清除本次所有記錄", type="secondary", key="clear_session"):
+            st.session_state.history = []
+            st.rerun()
+        for i, rec in enumerate(st.session_state.history):
+            action = _render_rec(rec, i, show_download=True, key_prefix="cur_")
+            if action == "delete":
+                st.session_state.history.pop(i)
+                st.rerun()
+
+    # ── 過去執行記錄 ──────────────────
+    st.markdown("### 過去執行記錄")
+    st.caption("來源：`history_log.json`，每次執行後自動追加，重新整理或關閉頁面後仍保留。")
+
+    # 排除本次工作階段已顯示的（以 ts 為鍵）
+    cur_ts = {r["ts"] for r in st.session_state.history}
+    past   = [r for r in st.session_state.history_log if r.get("ts") not in cur_ts]
+
+    if not past:
+        st.info("尚無過去記錄。")
+    else:
+        col_clr, _ = st.columns([2, 5])
+        with col_clr:
+            if st.button("🗑️ 清除所有過去記錄", type="secondary", key="clear_log"):
+                _save_history_log([])
+                st.session_state.history_log = []
+                st.rerun()
+        for i, rec in enumerate(past):
+            action = _render_rec(rec, i, show_download=False, key_prefix="past_")
+            if action == "delete":
+                log = _load_history_log()
+                log = [r for r in log if r.get("ts") != rec.get("ts")]
+                _save_history_log(log)
+                st.session_state.history_log = _load_history_log()
+                st.rerun()
