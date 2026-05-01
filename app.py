@@ -343,6 +343,237 @@ def run_text_mining(df, max_workers=6, timeout_sec=5, topk=15, use_textrank=True
     return df
 
 # =========================================================
+# Step 4：文章比對（關鍵字 × 組織名稱）
+# =========================================================
+_COMPANY_SUFFIXES = ["股份有限公司", "有限公司", "公司"]
+_SEP_PAT  = re.compile(r"[;；、，,\-/—－–／/·\.\s]+")
+_CH_PAT   = re.compile(r"^[\u4e00-\u9fff]$")
+_PAREN_PAT = re.compile(r"^(?P<main>.*?)(?:\(|（)(?P<brand>.*?)(?:\)|）)\s*$")
+
+def _has_cjk(s):
+    return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
+
+def _is_valid_token(t):
+    t = str(t or "").strip()
+    if not t: return False
+    if _has_cjk(t): return len(re.sub(r"[^\u4e00-\u9fff]", "", t)) >= 2
+    s = t.replace(" ", "")
+    if len(s) < 3: return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-_. ]*", t))
+
+def _filter_tokens(iterable):
+    out = set()
+    for x in (iterable or []):
+        x = str(x or "").strip()
+        if _is_valid_token(x): out.add(x)
+    return out
+
+def _strip_company_suffix(name):
+    s = str(name)
+    for suf in _COMPANY_SUFFIXES:
+        if s.endswith(suf): return s[:-len(suf)]
+    return s
+
+def _norm_name_match(name):
+    return str(name).lower().replace(" ", "").replace("\u3000", "")
+
+def _expand_name_variants(raw):
+    out = set()
+    if not raw: return out
+    base = str(raw).strip()
+    candidates = {base, _strip_company_suffix(base)}
+    m = _PAREN_PAT.match(base)
+    if m:
+        main = (m.group("main") or "").strip()
+        brand = (m.group("brand") or "").strip()
+        if main:
+            candidates.add(main); candidates.add(_strip_company_suffix(main))
+        if brand:
+            candidates.add(brand)
+            for t in _SEP_PAT.split(brand):
+                if t: candidates.add(t.strip())
+    tokens = [t for t in _SEP_PAT.split(base) if t]
+    if 2 <= len(tokens) <= 3 and all(_CH_PAT.match(t) and len(t) == 1 for t in tokens):
+        candidates.add("".join(tokens))
+        candidates.add("".join(reversed(tokens)))
+    return _filter_tokens(candidates)
+
+def _parse_existing_links(old_val):
+    pairs = []
+    if not old_val: return pairs
+    s = str(old_val).strip()
+    if s.lower() in ("無", "nan", "none", ""): return pairs
+    seen = set()
+    for p in re.split(r"[；;]+", s):
+        p = p.strip()
+        if not p: continue
+        m = re.search(r"(?:\(|（)?(?P<year>20\d{2})(?:\)|）|年)?\s*(?P<url>http\S+)", p)
+        if m: y, u = m.group("year") or "", m.group("url").strip()
+        else: y, u = "", p.strip()
+        if u and u not in seen:
+            pairs.append((y, u)); seen.add(u)
+    return pairs
+
+def _assemble_links(pairs):
+    uniq = {}
+    for y, u in pairs:
+        if u and u not in uniq: uniq[u] = y
+    items = [(y, u) for u, y in uniq.items()]
+    def _sk(t):
+        y, u = t
+        return (0, int(y), u) if re.fullmatch(r"20\d{2}", y or "") else (1, 9999, u)
+    items.sort(key=_sk)
+    return "；".join([f"({y}){u}" if re.fullmatch(r"20\d{2}", y or "") else u for y, u in items])
+
+def _union_tokens(old_text, new_tokens):
+    bag = set()
+    if old_text:
+        bag |= _filter_tokens(re.split(r"[；;]+", str(old_text).strip()))
+    bag |= _filter_tokens(new_tokens)
+    return "；".join(sorted(bag, key=lambda x: (len(x), x))) if bag else ""
+
+def _clean_cell(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)): return ""
+    s = str(x).strip()
+    return "" if s.lower() == "nan" else s
+
+def run_article_match(kw_df, df_main, new_date_int=0, prev_kw_map=None,
+                      match_fields=None, progress_cb=None):
+    """
+    kw_df   : Step 2 輸出（含 keywords, url, parsed_date, article_id）
+    df_main : Step 3 輸出的 02_精簡表 工作表
+    new_date_int : 「新文章」門檻（int，如 20251001），0 表示全部視為新文章
+    prev_kw_map  : {組織名稱: 舊關鍵字字串} 來自上一期
+    match_fields : 比對欄位清單，預設 ["組織名稱2","負責人2","單位聯絡人_new"]
+    progress_cb  : callable(pct, msg)
+    """
+    if match_fields is None:
+        match_fields = ["組織名稱2", "負責人2", "單位聯絡人_new"]
+    if prev_kw_map is None:
+        prev_kw_map = {}
+
+    def _prog(pct, msg):
+        if progress_cb: progress_cb(min(pct, 1.0), msg)
+
+    df_main = df_main.copy()
+    df_main.columns = pd.Index(df_main.columns).map(
+        lambda s: str(s or "").replace("\u3000", " ").strip())
+
+    for c in ["生命力新聞", "生命力新聞_new_match", "比對到的關鍵字", "比對狀態"]:
+        if c not in df_main.columns:
+            df_main[c] = ""
+
+    # 準備關鍵字 DataFrame
+    kw = kw_df.copy()
+    kw.columns = [c.strip().lower() for c in kw.columns]
+    kw["kw_nospace"] = (kw.get("keywords", pd.Series(dtype=str))
+                         .astype(str).fillna("").str.lower()
+                         .str.replace(" ", "", regex=False)
+                         .str.replace("\u3000", "", regex=False))
+    kw["dateint"] = pd.to_numeric(kw.get("parsed_date", pd.Series(dtype=str)),
+                                  errors="coerce").astype("Int64")
+    kw_new = kw[kw["dateint"].ge(new_date_int).fillna(False)].copy() if new_date_int else kw
+
+    from pandas import Series as _S
+    def safe_col(col):
+        return df_main[col].astype(str).fillna("") if col in df_main.columns else _S([""] * len(df_main), index=df_main.index)
+
+    col_newcat = safe_col("新增分類")
+    col_prev   = safe_col("上一期有無")
+    prev_exists = col_prev.str.contains("有|是|Y|1", na=False)
+    G1 = col_newcat.str.contains("持續存在", na=False)
+    G2 = col_newcat.str.contains("初期後出現", na=False) & prev_exists
+    G3 = col_newcat.str.contains("本期真正新增", na=False)
+    G4 = col_newcat.str.contains("歷史補回", na=False)
+    mask_merge_prev = G1 | G2 | G4
+
+    targets_idx = list(df_main.index[G1 | G2 | G3 | G4])
+    total = len(targets_idx)
+    _prog(0, f"比對中 (0 / {total})...")
+
+    for step_i, i in enumerate(targets_idx):
+        row = df_main.loc[i]
+        use_all = bool(G3.loc[i]) or bool(G4.loc[i])
+        kw_sub = kw if use_all else kw_new
+
+        names = [_clean_cell(row.get(c)) for c in match_fields if c in df_main.columns]
+        candidates = set()
+        for name in names:
+            candidates |= _expand_name_variants(name)
+
+        pairs_new, hit_terms = set(), set()
+        for orig in candidates:
+            cand = _norm_name_match(orig)
+            mask = kw_sub["kw_nospace"].str.contains(cand, na=False, regex=False)
+            if mask.any():
+                hit_terms.add(orig)
+                for _, r_art in kw_sub.loc[mask, ["dateint", "url"]].iterrows():
+                    y = str(int(r_art["dateint"]))[:4] if pd.notna(r_art["dateint"]) else ""
+                    pairs_new.add((y, str(r_art["url"]).strip()))
+
+        old_links_text = _clean_cell(row.get("生命力新聞"))
+        existing_pairs = set(_parse_existing_links(old_links_text))
+        old_urls = {u for _, u in existing_pairs}
+        true_new_pairs = [(y, u) for (y, u) in pairs_new if u not in old_urls]
+
+        df_main.at[i, "生命力新聞_new_match"] = _assemble_links(true_new_pairs)
+
+        old_kw = _clean_cell(row.get("比對到的關鍵字"))
+        merged_kw = _union_tokens(old_kw, hit_terms)
+        if bool(mask_merge_prev.loc[i]) and prev_kw_map:
+            key = _clean_cell(row.get("組織名稱2"))
+            merged_kw = _union_tokens(merged_kw, _filter_tokens(
+                re.split(r"[；;]+", prev_kw_map.get(key, ""))))
+
+        if not pairs_new and not hit_terms and not merged_kw:
+            merged_kw = "nan"
+        df_main.at[i, "比對到的關鍵字"] = merged_kw
+
+        if pairs_new:
+            df_main.at[i, "比對狀態"] = "本期新增"
+        elif existing_pairs:
+            df_main.at[i, "比對狀態"] = "僅歷史"
+
+        _prog((step_i + 1) / total * 0.8, f"比對中 ({step_i + 1} / {total})...")
+
+    # 生成比對結果整理
+    _prog(0.85, "生成比對結果整理...")
+    records = []
+    org_data = []
+    for idx, r in df_main.loc[G1 | G2 | G3 | G4].iterrows():
+        cands = set()
+        for c in match_fields:
+            if c in df_main.columns:
+                cands |= _expand_name_variants(_clean_cell(r.get(c)))
+        org_data.append(({_norm_name_match(x) for x in cands}, cands,
+                          bool(G3.loc[idx]) or bool(G4.loc[idx])))
+
+    for _, art in kw.iterrows():
+        txt = str(art.get("kw_nospace") or "")
+        dt = art.get("dateint")
+        hit = set()
+        for norm_set, orig_set, use_all in org_data:
+            if not use_all and new_date_int and (pd.isna(dt) or dt < new_date_int):
+                continue
+            if any(n in txt for n in norm_set):
+                hit |= {o for o in orig_set if _norm_name_match(o) in txt}
+        kw_out = "；".join(sorted(_filter_tokens(hit), key=lambda x: (len(x), x)))
+        if not hit: kw_out = "nan"
+        records.append({
+            "article_title": art.get("article_title", ""),
+            "url":           art.get("url", ""),
+            "parsed_date":   art.get("parsed_date", ""),
+            "article_id":    art.get("article_id", ""),
+            "keywords":      art.get("keywords", ""),
+            "比對到的關鍵字": kw_out,
+            "比對狀態":      "有" if hit else "無",
+        })
+    df_report = pd.DataFrame(records)
+
+    _prog(1.0, "完成！")
+    return df_main, df_report
+
+# =========================================================
 # Step 3：比對分析
 # =========================================================
 def _find_prev_col(P_prev, bare_col, new_col):
@@ -641,9 +872,10 @@ if "history" not in st.session_state:
 st.title("📊 生命力比對系統")
 st.caption("整合三個工作流程：文章去重 → 文字探勘 → 比對分析")
 
-tab_dedup, tab_mining, tab_compare, tab_history = st.tabs([
+tab_dedup, tab_mining, tab_match, tab_compare, tab_history = st.tabs([
     "📰 Step 1：文章去重",
     "🔍 Step 2：文字探勘",
+    "🔗 Step 4：文章比對",
     "📊 Step 3：比對分析",
     "📁 歷史記錄",
 ])
@@ -798,6 +1030,138 @@ with tab_mining:
             label="⬇️ 下載文字探勘結果 Excel",
             data=buf.getvalue(),
             file_name=fname_mining,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+# ── Step 4：文章比對 ───────────────────────────────────────
+with tab_match:
+    st.subheader("文章比對（Step 2 關鍵字 × Step 3 組織名稱）")
+    st.markdown("""
+    **輸入**：Step 2 文字探勘輸出 ＋ Step 3 比對分析輸出
+    **輸出**：更新後的比對結果，新增欄位：
+    - `生命力新聞_new_match`：本次新命中的文章 URL
+    - `比對到的關鍵字`：命中的關鍵字
+    - `比對狀態`：本期新增 / 僅歷史
+    - 工作表 `比對結果整理`：每篇文章對應到哪些組織
+    """)
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.markdown("**Step 2 輸出檔** ✱必填（含 keywords 欄位）")
+        match_kw_file = st.file_uploader("上傳文字探勘結果 (.xlsx)", type=["xlsx"], key="match_kw")
+        match_kw_sheet = st.text_input("工作表名稱", value="links", key="match_kw_sheet")
+    with col_m2:
+        st.markdown("**Step 3 輸出檔** ✱必填")
+        match_main_file = st.file_uploader("上傳比對分析結果 (.xlsx)", type=["xlsx"], key="match_main")
+        match_main_sheet = st.text_input("工作表名稱", value="02_精簡表(指定欄位)", key="match_main_sheet")
+
+    col_m3, col_m4 = st.columns(2)
+    with col_m3:
+        st.markdown("**上一期結果** *(選填，用於合併舊關鍵字)*")
+        match_prev_file = st.file_uploader("上傳上一期比對結果 (.xlsx)", type=["xlsx"], key="match_prev")
+        match_prev_sheet = st.text_input("工作表名稱", value="02_精簡表(指定欄位)", key="match_prev_sheet")
+    with col_m4:
+        new_date_str = st.text_input(
+            "「新文章」起始日期（YYYYMMDD）",
+            value="",
+            placeholder="留空表示全部文章都視為新文章",
+            help="早於此日期的文章只用於「本期真正新增」和「歷史補回」類別，不用於「持續存在」類別",
+        )
+
+    match_btn = st.button(
+        "🚀 開始文章比對", type="primary",
+        disabled=(match_kw_file is None or match_main_file is None),
+        use_container_width=True, key="match_run",
+    )
+
+    if match_btn:
+        with st.spinner("讀取檔案中..."):
+            try:
+                kw_sn = match_kw_sheet.strip() or 0
+                try:
+                    kw_df_in = pd.read_excel(match_kw_file, sheet_name=kw_sn)
+                except Exception:
+                    match_kw_file.seek(0)
+                    xf = pd.ExcelFile(match_kw_file)
+                    fb_sheet = "links" if "links" in xf.sheet_names else xf.sheet_names[0]
+                    match_kw_file.seek(0)
+                    kw_df_in = pd.read_excel(match_kw_file, sheet_name=fb_sheet)
+
+                main_sn = match_main_sheet.strip() or 0
+                df_main_in = pd.read_excel(match_main_file, sheet_name=main_sn)
+
+                prev_kw_map = {}
+                if match_prev_file:
+                    try:
+                        prev_sn = match_prev_sheet.strip() or 0
+                        df_prev = pd.read_excel(match_prev_file, sheet_name=prev_sn)
+                        df_prev.columns = pd.Index(df_prev.columns).map(
+                            lambda s: str(s or "").replace("\u3000", " ").strip())
+                        name_col = "組織名稱2" if "組織名稱2" in df_prev.columns else None
+                        if name_col and "比對到的關鍵字" in df_prev.columns:
+                            prev_kw_map = dict(zip(
+                                df_prev[name_col].astype(str),
+                                df_prev["比對到的關鍵字"].astype(str),
+                            ))
+                    except Exception as e:
+                        st.warning(f"上一期結果讀取失敗，略過：{e}")
+
+                new_date_int = 0
+                if new_date_str.strip():
+                    try:
+                        new_date_int = int(new_date_str.strip())
+                    except ValueError:
+                        st.warning("日期格式錯誤，應為 YYYYMMDD，已略過日期篩選。")
+
+                st.info(f"關鍵字檔：{len(kw_df_in)} 筆，比對主檔：{len(df_main_in)} 筆")
+            except Exception as e:
+                st.error(f"讀取失敗：{e}")
+                st.stop()
+
+        prog_bar  = st.progress(0, text="準備中...")
+        prog_text = st.empty()
+
+        def _match_progress(pct, msg):
+            prog_bar.progress(pct, text=msg)
+            prog_text.caption(msg)
+
+        try:
+            df_main_out, df_report = run_article_match(
+                kw_df_in, df_main_in,
+                new_date_int=new_date_int,
+                prev_kw_map=prev_kw_map,
+                progress_cb=_match_progress,
+            )
+        except Exception as e:
+            prog_bar.empty(); prog_text.empty()
+            st.error(f"文章比對失敗：{e}")
+            st.stop()
+
+        prog_bar.progress(1.0, text="完成！")
+        prog_text.empty()
+
+        hit_ct    = int((df_main_out["比對狀態"] == "本期新增").sum())
+        hist_ct   = int((df_main_out["比對狀態"] == "僅歷史").sum())
+        art_hit   = int((df_report["比對狀態"] == "有").sum())
+        st.success(f"比對完成！組織命中：本期新增 {hit_ct} 筆 / 僅歷史 {hist_ct} 筆；文章有命中：{art_hit} / {len(df_report)} 篇")
+
+        st.markdown("**組織比對結果預覽（前 30 筆）**")
+        preview_m = [c for c in ["組織名稱2","新增分類","生命力新聞","生命力新聞_new_match","比對到的關鍵字","比對狀態"]
+                     if c in df_main_out.columns]
+        st.dataframe(df_main_out[preview_m].head(30), use_container_width=True, hide_index=True)
+
+        # 輸出 Excel（保留主檔其他工作表）
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df_main_out.to_excel(w, sheet_name="02_精簡表(指定欄位)", index=False)
+            df_report.to_excel(w, sheet_name="比對結果整理", index=False)
+        fname_match = f"比對結果_更新後_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        st.download_button(
+            label="⬇️ 下載文章比對結果 Excel",
+            data=buf.getvalue(),
+            file_name=fname_match,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
