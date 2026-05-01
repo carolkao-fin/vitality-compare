@@ -253,10 +253,15 @@ def run_text_mining(df, max_workers=6, timeout_sec=5, topk=15, use_textrank=True
                     progress_cb=None):
     """
     df 需有 url 欄位，article_title 欄位選填。
-    progress_cb: callable(current, total) 用於回報進度。
+    progress_cb: callable(pct: float, msg: str)
+      爬取階段佔 0–0.5，jieba 解析階段佔 0.5–1.0
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import jieba  # noqa: ensure jieba is loaded
+
+    def _prog(pct, msg):
+        if progress_cb:
+            progress_cb(min(pct, 1.0), msg)
 
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
@@ -269,7 +274,8 @@ def run_text_mining(df, max_workers=6, timeout_sec=5, topk=15, use_textrank=True
     urls = df["url"].astype(str).str.strip().tolist()
     n = len(urls)
 
-    # 併發爬取
+    # ── 階段一：併發爬取（0% → 50%）──
+    _prog(0, f"爬取中 (0 / {n})...")
     session = _make_session()
     res_title = [None] * n
     res_text  = [None] * n
@@ -283,10 +289,10 @@ def run_text_mining(df, max_workers=6, timeout_sec=5, topk=15, use_textrank=True
             i = future_map[fut]
             res_title[i], res_text[i], res_err[i] = fut.result()
             done += 1
-            if progress_cb:
-                progress_cb(done, n)
+            _prog(done / n * 0.5, f"爬取中 ({done} / {n})...")
 
-    # 解析與關鍵字
+    # ── 階段二：jieba 解析（50% → 100%）──
+    _prog(0.5, f"jieba 解析中 (0 / {n})...")
     parsed_dates, final_titles = [], []
     jieba_cols, rule_cols, merged_cols = [], [], []
     content_len_col, raw_preview_col   = [], []
@@ -316,6 +322,8 @@ def run_text_mining(df, max_workers=6, timeout_sec=5, topk=15, use_textrank=True
         merged_cols.append("、".join(merged))
         content_len_col.append(len(text_full))
         raw_preview_col.append(text_full[:120].replace("\n", " "))
+
+        _prog(0.5 + (i + 1) / n * 0.5, f"jieba 解析中 ({i + 1} / {n})...")
 
     df["article_title"] = final_titles
     df["parsed_date"]   = parsed_dates
@@ -747,28 +755,31 @@ with tab_mining:
             st.stop()
 
         # 進度顯示
-        progress_bar  = st.progress(0, text="爬取中 (0 / ?)")
-        status_text   = st.empty()
+        progress_bar = st.progress(0, text="準備中...")
+        progress_text = st.empty()
 
-        def update_progress(done, total):
-            pct = done / total if total > 0 else 0
-            progress_bar.progress(pct, text=f"爬取中 ({done} / {total})")
+        def _mining_progress(pct, msg):
+            progress_bar.progress(pct, text=msg)
+            phase = "階段 1/2：網路爬取" if pct <= 0.5 else "階段 2/2：jieba 關鍵字分析"
+            progress_text.caption(phase)
 
-        with st.spinner("執行文字探勘中，請耐心等候..."):
-            try:
-                result_df = run_text_mining(
-                    df_in,
-                    max_workers=int(max_workers),
-                    timeout_sec=int(timeout_sec),
-                    topk=int(topk),
-                    use_textrank=use_textrank,
-                    progress_cb=update_progress,
-                )
-            except Exception as e:
-                st.error(f"文字探勘失敗：{e}")
-                st.stop()
+        try:
+            result_df = run_text_mining(
+                df_in,
+                max_workers=int(max_workers),
+                timeout_sec=int(timeout_sec),
+                topk=int(topk),
+                use_textrank=use_textrank,
+                progress_cb=_mining_progress,
+            )
+        except Exception as e:
+            progress_bar.empty()
+            progress_text.empty()
+            st.error(f"文字探勘失敗：{e}")
+            st.stop()
 
         progress_bar.progress(1.0, text="完成！")
+        progress_text.empty()
         unknown_ct = int((result_df["parsed_date"] == "unknown").sum())
         err_ct     = int(result_df["fetch_error"].astype(bool).sum())
         st.success(f"文字探勘完成！共 {len(result_df)} 篇，未知日期 {unknown_ct} 篇，爬取失敗 {err_ct} 篇")
