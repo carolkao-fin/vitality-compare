@@ -962,7 +962,7 @@ def make_excel_text_fmt(sheets_dict):
 # UI — 5 個 Tab
 # =========================================================
 st.title("📊 生命力比對系統")
-st.caption("完整工作流程：Step1 文章去重 → Step2 文字探勘 → Step3 文章比對 → Step4 比對分析 → Step5 格式修正")
+st.caption("完整工作流程：Step1 文章去重 → Step2 文字探勘 → Step3 比對分析 → Step4 文章比對（需 Step2+Step3 輸出）→ Step5 格式修正")
 
 with st.sidebar:
     st.markdown("## 🧭 作業流程（A → E）")
@@ -999,7 +999,7 @@ with st.sidebar:
 - articles_deduped.xlsx（唯一文章表）
 - （可選）keywords_audit.xlsx（高頻可疑詞審核清單）
 
-👉 對應系統步驟：**Step 1 文章去重** → **Step 2 文字探勘** → **Step 3 文章比對**
+👉 對應系統步驟：**Step 1 文章去重** → **Step 2 文字探勘**
         """)
 
     with st.expander("**C. 依命中狀態決定比對範圍**", expanded=False):
@@ -1017,7 +1017,7 @@ with st.sidebar:
 - 比對結果_逐筆（含：命中狀態、比對期間、文章清單、比對到的關鍵字）
 - 比對結果整理（彙總：每組織命中篇數、最新文章日期）
 
-👉 對應系統步驟：**Step 3 文章比對** → **Step 4 比對分析**
+👉 對應系統步驟：**Step 3 比對分析** → **Step 4 文章比對**（Step 4 同時需要 Step 2 輸出）
         """)
 
     with st.expander("**D. 可疑名稱人工審核與社創資格確認**", expanded=False):
@@ -1043,7 +1043,7 @@ with st.sidebar:
 - 比對結果整理（管理者檢視）
 - 疑義表（待查事項追蹤）
 
-👉 對應系統步驟：**Step 4 比對分析** → **Step 5 格式修正** 後匯出
+👉 對應系統步驟：**Step 4 文章比對** → **Step 5 格式修正** 後匯出
         """)
 
     st.divider()
@@ -1075,11 +1075,11 @@ with st.sidebar:
 | 文章資料 | article_title, url, parsed_date, article_id, keywords |
     """)
 
-tab_dedup, tab_mining, tab_match, tab_compare, tab_fmt, tab_history = st.tabs([
+tab_dedup, tab_mining, tab_compare, tab_match, tab_fmt, tab_history = st.tabs([
     "📰 Step 1：文章去重",
     "🔍 Step 2：文字探勘",
-    "🔗 Step 3：文章比對",
-    "📊 Step 4：比對分析",
+    "📊 Step 3：比對分析",
+    "🔗 Step 4：文章比對",
     "🔧 Step 5：格式修正",
     "📁 歷史記錄",
 ])
@@ -1240,9 +1240,19 @@ with tab_mining:
 
 # ── Step 4：文章比對 ───────────────────────────────────────
 with tab_match:
-    st.subheader("文章比對（Step 2 關鍵字 × Step 4 組織名稱）")
+    st.subheader("文章比對（Step 4）")
+    st.info(
+        "⚠️ **執行前置條件**：本步驟同時需要 Step 2（文字探勘）與 Step 3（比對分析）的輸出檔，"
+        "請確認兩者皆已完成後再執行。\n\n"
+        "**Step 1 → Step 2**（文章去重 → 文字探勘）和 **Step 3**（比對分析）可平行準備，"
+        "但 Step 4 必須在兩者都完成後才能進行。",
+        icon="📌",
+    )
     st.markdown("""
-    **輸入**：Step 2 文字探勘輸出 ＋ Step 3 比對分析輸出
+    **輸入**：
+    - Step 2 輸出（articles with keywords）
+    - Step 3 輸出（比對分析結果 `02_精簡表(指定欄位)`）
+
     **輸出**：更新後的比對結果，新增欄位：
     - `生命力新聞_new_match`：本次新命中的文章 URL
     - `比對到的關鍵字`：命中的關鍵字
@@ -1372,7 +1382,7 @@ with tab_match:
 
 # ── Step 3：比對分析 ───────────────────────────────────────
 with tab_compare:
-    st.subheader("比對分析（A × B × P 三期稽核）（Step 4）")
+    st.subheader("比對分析（Step 3）")
     st.caption("上傳社創資料庫（A）、生命力新聞（B）、上一期結果（P）、最初期結果（I），執行三期稽核比對分析。")
 
     col1, col2 = st.columns(2)
